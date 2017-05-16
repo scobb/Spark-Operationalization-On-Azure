@@ -86,14 +86,9 @@ class AMLHelpers(Magics):
     @line_magic
     def check_deployment(self, line):
         from azure.cli.core._profile import Profile
-        from azure.cli.core.commands import client_factory
-        from azure.mgmt.resource.resources import ResourceManagementClient
-        from azure.cli.command_modules.ml._az_util import az_get_app_insights_account
+        from azure.cli.command_modules.ml.env import env_setup
+        from azure.cli.command_modules.ml._util import JupyterContext
         self._redirect_logging('az.azure.cli.core._profile')
-        p = argparse.ArgumentParser()
-        p.add_argument('-d', '--deployment', help='Long running deployment to check', required=True)
-        parsed_args = p.parse_args(line.split())
-        deployment_name = parsed_args.deployment
 
         # validate that user has selected a subscription
         profile = Profile()
@@ -102,57 +97,7 @@ class AMLHelpers(Magics):
             print('Please run %%select_sub before attempting to query.')
             return
 
-        if 'deployment' not in deployment_name:
-            print("Not a valid AML deployment name.")
-
-        resource_group = deployment_name.split('deployment')[0]
-        client = client_factory.get_mgmt_service_client(ResourceManagementClient).deployments
-        result = client.get(resource_group, deployment_name)
-        if result.properties.provisioning_state != 'Succeeded':
-            print('Deployment status: {}'.format(result.properties.provisioning_state))
-            return
-
-        completed_deployment = result
-
-        if 'appinsights' in completed_deployment.name:
-            (app_insights_account_name,
-             app_insights_account_key) = az_get_app_insights_account(completed_deployment)
-            if app_insights_account_name and app_insights_account_key:
-
-                print("Environment updated with AppInsight information.")
-                print("This notebook will keep this environment available, though kernel restarts will clear it.")
-                print("To reset the environment, use the following commands:")
-                print(' import os')
-                result_str = '\n'.join([
-                        self.print_and_update_env('AML_APP_INSIGHTS_NAME', app_insights_account_name),
-                        self.print_and_update_env('AML_APP_INSIGHTS_KEY', app_insights_account_key)])
-                try:
-                    with open(os.path.join(os.path.expanduser('~'), '.amlenvrc'), 'a') as env_file:
-                        env_file.write(result_str)
-                        print('{} has also been updated.'.format(env_file.name))
-                except IOError:
-                    pass
-        else:
-            acs_master = completed_deployment.properties.outputs['masterFQDN']['value']
-            acs_agent = completed_deployment.properties.outputs['agentpublicFQDN'][
-                'value']
-            if acs_master and acs_agent:
-                print('ACS deployment succeeded.')
-                print("Environment updated with ACS information.")
-                print("This notebook will keep this environment available, though kernel restarts will clear it.")
-                print("To reset the environment, use the following commands:")
-                print(' import os')
-
-                result_str = '\n'.join([
-                        self.print_and_update_env('AML_ACS_MASTER', acs_master),
-                        self.print_and_update_env('AML_ACS_AGENT', acs_agent)])
-                try:
-                    with open(os.path.join(os.path.expanduser('~'), '.amlenvrc'), 'a') as env_file:
-                        env_file.write(result_str)
-                        print('{} has also been updated.'.format(env_file.name))
-                except IOError:
-                    pass
-
+        env_setup(True, None, None, None, None, None, context=JupyterContext())
 
     @line_magic
     def aml_env_setup(self, line):
@@ -160,83 +105,42 @@ class AMLHelpers(Magics):
         self._redirect_logging('az.azure.cli.core._profile')
         p = argparse.ArgumentParser()
         p.add_argument('-n', '--name', help='base name for your environment', required=True)
+        p.add_argument('-k', dest='kubernetes', help='Flag to indicate kubernetes environment', required=False, action='store_true')
+        p.add_argument('-l', dest='local_only', help='Flag to preclude ACS deployment', required=False, action='store_true')
+        p.add_argument('-a', dest='service_principal_app_id', help='AppID of service principal', required=False)
+        p.add_argument('-p', dest='service_principal_password', help='Client Secret of service principal', required=False)
         parsed_args = p.parse_args(line.split())
-
         # validate that user has selected a subscription
         profile = Profile()
         subs = profile.load_cached_subscriptions()
         if not subs:
-            print('Please run %%select_sub before attempting to set up environment.')
+            print('Please run %select_sub before attempting to set up environment.')
             return
-        from azure.cli.command_modules.ml._util import create_ssh_key_if_not_exists
+        from azure.cli.command_modules.ml.env import env_setup
         from azure.cli.command_modules.ml._util import JupyterContext
-        from azure.cli.command_modules.ml._az_util import az_create_resource_group
-        from azure.cli.command_modules.ml._az_util import az_create_app_insights_account
-        from azure.cli.command_modules.ml._az_util import az_create_storage_and_acr
-        from azure.cli.command_modules.ml._az_util import az_create_acs
-        from azure.cli.command_modules.ml._az_util import query_deployment_status
-        from azure.cli.command_modules.ml._az_util import az_get_app_insights_account
-        from azure.cli.command_modules.ml._az_util import AzureCliError
-        import time
-        print('Setting up your Azure ML environment with a storage account, App Insights account, ACR registry and ACS cluster.')
         c = JupyterContext()
-        try:
-            ssh_public_key = create_ssh_key_if_not_exists()
-        except:
-            return
-        resource_group = az_create_resource_group(c, parsed_args.name)
-        app_insights_deployment_id = az_create_app_insights_account(parsed_args.name, resource_group)
-        (acr_login_server, c.acr_username, acr_password, storage_account_name, storage_account_key) = \
-            az_create_storage_and_acr(parsed_args.name, resource_group)
-
+        c.set_input_response('Continue with this subscription (Y/n)? ', 'y')
+        print('Setting up AML environment. Feel free to continue interacting with the rest '
+              'of your notebook until this cell updates...')
         with Capturing() as output:
-            az_create_acs(parsed_args.name, resource_group, acr_login_server, c.acr_username,
-                          acr_password, ssh_public_key)
-
+            env_setup(None, parsed_args.name, parsed_args.kubernetes, parsed_args.local_only,
+                      parsed_args.service_principal_app_id, parsed_args.service_principal_password,
+                      c)
         acs_regex = r"az ml env setup -s (?P<deployment_id>[^']+)"
+        env_regex = r'export (?P<k>[^=]+)=(?P<v>.+)'
+
         for line in output:
             s = re.search(acs_regex, line)
             if s:
                 print('To check the status of the deployment, run line magic %check_deployment -d {}'.format(s.group('deployment_id')))
             else:
-                print(line)
+                s = re.search(env_regex, line)
+                if s:
+                    self.print_and_update_env(s.group('k'), s.group('v'))
+                else:
+                    print(line)
 
-        completed_deployment = None
-        while not completed_deployment:
-            try:
-                print('Querying App Insights deployment...')
-                completed_deployment = query_deployment_status(resource_group,
-                                                               app_insights_deployment_id)
-                time.sleep(5)
-            except AzureCliError as exc:
-                print(exc.message)
-                break
-
-        print("Environment configured, pending ACS deployment completion.")
-        print("This notebook will keep this environment available, though kernel restarts will clear it.")
-        print("To reset the environment, use the following commands:")
-        print(' import os')
-
-        result_str = ''
-        if completed_deployment:
-            app_insights_account_name, app_insights_account_key = az_get_app_insights_account(
-                completed_deployment)
-            result_str = '\n'.join([
-                self.print_and_update_env('AML_APP_INSIGHTS_NAME', app_insights_account_name),
-                self.print_and_update_env('AML_APP_INSIGHTS_KEY', app_insights_account_key)])
-        result_str += '\n'.join([
-            self.print_and_update_env('AML_STORAGE_ACCT_NAME', storage_account_name),
-            self.print_and_update_env('AML_STORAGE_ACCT_KEY', storage_account_name),
-            self.print_and_update_env('AML_ACR_HOME', acr_login_server),
-            self.print_and_update_env('AML_ACR_USER', c.acr_username),
-            self.print_and_update_env('AML_ACR_PW', acr_password)])
-        try:
-            with open(os.path.expanduser('~/.amlenvrc'), 'w+') as env_file:
-                env_file.write(result_str)
-                print('You can also find these settings saved in {}'.format(env_file.name))
-        except IOError:
-            pass
-
+        print('These values have also been added to the current environment.')
 
     @cell_magic
     def publish_realtime_local(self, parameter_s='', cell=None):
